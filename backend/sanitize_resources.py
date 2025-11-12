@@ -1,38 +1,57 @@
-# sanitize_resources.py  (fixed)
-import io, csv, os, sys, codecs
+import pandas as pd
+import re
+import csv
 
-SRC = os.path.join("data","resources.csv")
-OUT = os.path.join("data","resources_clean.csv")
+# Input + output paths
+input_path = "data/resources.csv"
+output_path = "data/resources_clean.csv"
 
-if not os.path.exists(SRC):
-    print("Source not found:", SRC); sys.exit(1)
+def clean_cell(v):
+    """Cleans up a single cell string."""
+    if pd.isna(v):
+        return ""
+    s = str(v)
+    s = re.sub(r'[\r\n]+', ' ', s)
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = s.replace('\"', '"').strip()
+    return s
 
-def normalize_text(s):
-    if s is None: return ""
-    s = s.replace('\u2018', "'").replace('\u2019', "'").replace('\u201c', '"').replace('\u201d', '"')
-    s = s.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
-    return s.strip()
+# --- Try loading flexibly ---
+try:
+    df = pd.read_csv(
+        input_path,
+        sep=None,           # Let pandas infer separator
+        engine="python",    # Needed for messy CSVs
+        quoting=csv.QUOTE_MINIMAL,
+        on_bad_lines="skip",
+        dtype=str
+    )
+except Exception as e:
+    print("⚠️ Flexible read failed, retrying with defaults:", e)
+    df = pd.read_csv(input_path, on_bad_lines="skip", dtype=str, encoding="utf-8")
 
-bad = total = 0
-# use builtin open with newline='' (csv writer needs this)
-with open(SRC, "r", encoding="utf-8", errors="replace") as inf, \
-     open(OUT, "w", encoding="utf-8", errors="replace", newline='') as outf:
-    writer = csv.writer(outf, quoting=csv.QUOTE_MINIMAL)
-    for raw in inf:
-        total += 1
-        line = raw.rstrip("\n\r")
-        if len(line) >= 2 and line[0] == "'" and line[-1] == "'":
-            line = line[1:-1]
-        parts = line.split("\t")
-        parts = [normalize_text(p) for p in parts]
-        if len(parts) <= 1 and all(not p for p in parts):
-            bad += 1
-            continue
-        try:
-            writer.writerow(parts)
-        except Exception as e:
-            bad += 1
-            print("WRITE ERROR line", total, "->", e)
-            continue
+# --- Clean the data ---
+df = df.dropna(axis=1, how="all")  # Drop fully empty columns
+df = df.loc[:, ~df.columns.duplicated()]  # Remove duplicate columns
 
-print(f"Done. Wrote {OUT} (input lines: {total}, skipped: {bad})")
+for c in df.columns:
+    df[c] = df[c].map(clean_cell)
+
+# --- Keep only relevant textual columns ---
+keep_cols = [
+    c for c in df.columns
+    if any(x in c.lower() for x in [
+        "title", "url", "desc", "intro", "skills",
+        "rating", "duration", "site", "platform", "course"
+    ])
+]
+
+if keep_cols:
+    df = df[keep_cols]
+
+# --- Save cleaned CSV ---
+df.to_csv(output_path, index=False, quoting=csv.QUOTE_MINIMAL, encoding="utf-8-sig")
+
+print(f"✅ Cleaned CSV saved to {output_path}")
+print(f"Rows: {len(df)}, Columns: {len(df.columns)}")
+print("Columns kept:", ", ".join(df.columns))

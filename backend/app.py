@@ -1,462 +1,600 @@
 # app.py
 import os
-import io
-import json
-import traceback
-from typing import List, Optional
+import sys
+import re
+import csv
+import logging
+import time
+from io import StringIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+import spacy
+from sentence_transformers import SentenceTransformer, util
 
-# NLP / ML feature imports - import heavy libs lazily / safely
-SBERT_AVAILABLE = True
-embedder = None
+# optional PDF extractors
 try:
-    from sentence_transformers import SentenceTransformer
-except Exception as e:
-    SBERT_AVAILABLE = False
-    embedder = None
-    print("ML libs not available or SBERT import failed:", repr(e))
-
-# scikit-learn imports (TF-IDF / cosine)
-from sklearn.metrics.pairwise import cosine_similarity
-
-# Vectorizers (fallbacks)
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-
-# NearestNeighbors only used when SBERT embeddings are available
-try:
-    from sklearn.neighbors import NearestNeighbors
+    import pdfplumber
+    _HAS_PDFPLUMBER = True
 except Exception:
-    NearestNeighbors = None
+    pdfplumber = None
+    _HAS_PDFPLUMBER = False
 
-# PDF extraction
-import pdfplumber
-
-# App
-app = FastAPI(title="Skill Gap Analyzer - Backend (robust)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE = os.path.dirname(_file_)
-# Use cleaned CSV placed in backend/data/resources_clean.csv (you said you created that)
-DATA_PATH = os.path.join(BASE, "data", "resources_clean.csv")
-
-# Model name (if SBERT available)
-SBERT_MODEL = os.getenv("SBERT_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
-# Globals to hold resources & vectors
-df: Optional[pd.DataFrame] = None
-texts: List[str] = []
-resource_embeddings = None
-resource_tfidf = None
-vectorizer = None
-nbrs = None
-
-
-def safe_read_csv(path: str) -> pd.DataFrame:
-    """
-    Attempt robust CSV loading:
-    1) try autodetect (sep=None, engine='python')
-    2) try tab-separated
-    3) fall back to reading lines and splitting on '\t' or commas minimally
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Resources file not found at {path}")
-
-    # Attempt 1: autodetect
-    try:
-        df_local = pd.read_csv(path, sep=None, engine="python", encoding="utf-8", header=0)
-        print("CSV auto-detect success. Columns:", df_local.shape)
-        return df_local
-    except Exception as e:
-        print("CSV auto-detect failed:", e)
-
-    # Attempt 2: tab-separated
-    try:
-        df_local = pd.read_csv(path, sep="\t", engine="python", encoding="utf-8", header=None)
-        print("CSV loaded as tab-separated. Rows:", len(df_local))
-        return df_local
-    except Exception as e:
-        print("CSV tab-load failed:", e)
-
-    # Attempt 3: naive line split -> build DataFrame with fallback columns
-    try:
-        rows = []
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip("\n\r")
-                # if it contains tabs, split by tabs else split by comma
-                if "\t" in line:
-                    parts = line.split("\t")
-                else:
-                    parts = line.split(",")
-                rows.append(parts)
-        # create dataframe, pad rows to equal length
-        maxc = max(len(r) for r in rows) if rows else 0
-        rows2 = [r + [""] * (maxc - len(r)) for r in rows]
-        df_local = pd.DataFrame(rows2)
-        print("CSV fallback read. Rows:", len(df_local), "Cols:", df_local.shape[1])
-        return df_local
-    except Exception as e:
-        print("CSV fallback also failed:", e)
-        raise
-
-
-def load_resources(path: str):
-    global df, texts, resource_embeddings, resource_tfidf, vectorizer, nbrs
-
-    print("DATA_PATH ->", path)
-    df_local = safe_read_csv(path)
-
-    # Normalize columns: try to find title/description columns if present, else combine all text columns
-    # Heuristic: common column names
-    colnames = [c.lower() for c in df_local.columns.astype(str)]
-    title_col = None
-    desc_col = None
-    for c in df_local.columns:
-        lc = str(c).lower()
-        if "title" in lc and title_col is None:
-            title_col = c
-        if "description" in lc and desc_col is None:
-            desc_col = c
-        if "url" in lc and "link" not in lc:
-            # ignore url for text
-            pass
-
-    # If no title/description columns, combine textual columns (object dtype)
-    def make_text_row(row):
-        pieces = []
-        if title_col is not None:
-            pieces.append(str(row.get(title_col, "") or ""))
-        if desc_col is not None:
-            pieces.append(str(row.get(desc_col, "") or ""))
-        # add any other string-like columns that look useful (limit to first 3)
-        if title_col is None and desc_col is None:
-            # fallback: join all string columns
-            for k, v in row.items():
-                if isinstance(v, str) and v.strip():
-                    pieces.append(v.strip())
-        return " - ".join([p.strip() for p in pieces if p is not None and str(p).strip()])
-
-    # Ensure df_local is a dataframe
-    df_local = df_local.fillna("")
-    df_local["text"] = df_local.apply(make_text_row, axis=1)
-    texts_local = df_local["text"].astype(str).tolist()
-    # strip empty
-    texts_local = [t.strip() for t in texts_local]
-
-    # assign globals
-    df = df_local
-    texts = texts_local
-    print("Loaded resources rows:", len(texts))
-
-    # Try to load SBERT embedder if available
-    if SBERT_AVAILABLE:
-        try:
-            global embedder
-            if embedder is None:
-                print("Loading SBERT model:", SBERT_MODEL)
-                embedder = SentenceTransformer(SBERT_MODEL)
-                print("SBERT model loaded.")
-            # compute resource embeddings (silent if no texts)
-            if texts:
-                resource_embeddings = embedder.encode(texts, show_progress_bar=False, convert_to_numpy=True)
-                # fit NearestNeighbors if available
-                if NearestNeighbors is not None:
-                    nbrs = NearestNeighbors(n_neighbors=min(10, len(texts)), metric="cosine").fit(resource_embeddings)
-                print("Resource embeddings computed:", resource_embeddings.shape)
-                return
-        except Exception as e:
-            print("SBERT model failed to load/encode:", repr(e))
-            # fallback to vectorizers below
-
-    # If SBERT not available or failed, fallback to TF-IDF or CountVectorizer
-    print("Falling back to TF-IDF / CountVectorizer.")
-    # Try TF-IDF (with light preprocessing)
-    try:
-        # Minimal custom tokenizer/preproc is left to sklearn defaults
-        vectorizer_local = TfidfVectorizer(max_features=20000, stop_words="english")
-        if any(t.strip() for t in texts):
-            resource_tfidf_local = vectorizer_local.fit_transform(texts)
-            if resource_tfidf_local.shape[1] == 0:
-                raise ValueError("empty vocabulary after TF-IDF fit")
-            vectorizer = vectorizer_local
-            resource_tfidf = resource_tfidf_local
-            print("TF-IDF matrix shape:", resource_tfidf.shape)
-            return
-        else:
-            raise ValueError("No resource texts available for TF-IDF")
-    except Exception as e:
-        print("TF-IDF failed:", repr(e))
-
-    # Try CountVectorizer
-    try:
-        vectorizer_local = CountVectorizer(max_features=20000)
-        resource_tfidf_local = vectorizer_local.fit_transform(texts)
-        vectorizer = vectorizer_local
-        resource_tfidf = resource_tfidf_local
-        print("CountVectorizer matrix shape:", resource_tfidf.shape)
-        return
-    except Exception as e:
-        print("CountVectorizer failed:", repr(e))
-
-    # If all fail, keep them None and the search will return fallback items
-    print("No text vectors available. Search will return fallback results.")
-
-
-# initialize on startup
 try:
-    load_resources(DATA_PATH)
-except Exception as e:
-    print("Initial load_resources failed:", repr(e))
+    import PyPDF2
+    _HAS_PYPDF2 = True
+except Exception:
+    PyPDF2 = None
+    _HAS_PYPDF2 = False
 
+# local semantic extractor (assumes this file exists)
+import semantic_extractor as semx
 
-def compute_text_embedding(text: str):
-    """
-    Returns numpy vector for the input text using embedder (SBERT) or vectorizer (TF-IDF).
-    If neither available, returns None.
-    """
-    global embedder, vectorizer
-    if SBERT_AVAILABLE and embedder is not None:
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+logger = logging.getLogger("skill-gap-backend")
+
+app = FastAPI(title="Skill Gap Analyzer (backend)")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ---------------- helpers ----------------
+STOPWORDS = {
+    "and","or","the","a","an","to","for","of","in","on","with","by",
+    "is","are","be","as","that","this","we","you","will","your","have","has",
+    "using","use","can","should","may","role","responsible","experience","years","equivalent"
+}
+
+# additional blacklist for tokens that are not skills
+EXTRA_BLACKLIST = {"json"}
+
+TECH_PHRASES = [
+    "node js","node.js","react js","reactjs","next js","nextjs","express js","expressjs",
+    "mongo db","mongodb","rest api","restful api","machine learning","deep learning",
+    "data science","c++","c#","aws","cloudinary","firebase","django","flask","sql","nosql",
+    "docker","kubernetes","git","github","redux","tailwind","tailwindcss","typescript","ci/cd","ci cd",
+    "jwt","oauth","mongoose","material ui","postman","vercel","render"
+]
+
+def clean_text(s: Optional[Any]) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    s = re.sub(r"(_x000D_|\\x[\da-fA-F]{2}|Ã..|â..|[\u2018\u2019\u201c\u201d])+"," ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s
+
+def to_native(x):
+    if isinstance(x, (np.floating, np.float32, np.float64)):
+        return float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return to_native(x.item())
+    except Exception:
+        pass
+    return x
+
+# ---------------- PDF extraction ----------------
+def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
+    text_parts = []
+    if _HAS_PDFPLUMBER:
         try:
-            vec = embedder.encode([text], convert_to_numpy=True)[0]
-            return vec
+            import io
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for p in pdf.pages:
+                    page_text = p.extract_text() or ""
+                    text_parts.append(page_text)
+            if text_parts:
+                return "\n".join(text_parts)
         except Exception as e:
-            print("SBERT compute_text_embedding failed:", e)
-            return None
-    # fallback to vectorizer
-    if vectorizer is not None:
+            logger.warning("pdfplumber extraction failed: %s", e)
+    if _HAS_PYPDF2:
         try:
-            X = vectorizer.transform([text])
-            # convert to dense numpy array (row vector)
-            return X.toarray()[0]
+            import io
+            reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            for p in reader.pages:
+                try:
+                    page_text = p.extract_text() or ""
+                    text_parts.append(page_text)
+                except Exception:
+                    continue
+            if text_parts:
+                return "\n".join(text_parts)
         except Exception as e:
-            print("Vectorizer transform failed:", e)
-            return None
-    return None
+            logger.warning("PyPDF2 extraction failed: %s", e)
+    try:
+        return file_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
+# ---------------- data paths ----------------
+HERE = Path(__file__).parent.resolve()
+DEFAULT_DATA_DIR = HERE / "data"
+cand1 = DEFAULT_DATA_DIR / "resources_clean.csv"
+cand2 = DEFAULT_DATA_DIR / "resources.csv"
+DATA_PATH = None
+env_dp = os.getenv("DATA_PATH")
+if env_dp:
+    DATA_PATH = Path(env_dp)
+else:
+    if cand1.exists():
+        DATA_PATH = cand1
+    elif cand2.exists():
+        DATA_PATH = cand2
+
+logger.info("Resolved DATA_PATH -> %s", str(DATA_PATH) if DATA_PATH else "None (no CSV found)")
+
+# ---------------- global stores ----------------
+RESOURCES_DF: pd.DataFrame = pd.DataFrame()
+RESOURCE_TEXTS: List[str] = []
+RESOURCE_EMBEDDINGS = None
+MODEL: Optional[SentenceTransformer] = None
+CSV_SKILLS = set()
+KNOWN_SKILLS: List[str] = []
+KNOWN_EMBS = None
+
+# ---------------- delimiter detection + CSV load ----------------
+def detect_delimiter(sample_bytes: bytes) -> str:
+    try:
+        sample = sample_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        try:
+            sample = sample_bytes.decode("latin1", errors="replace")
+        except Exception:
+            sample = ""
+    counts = {
+        ",": sample.count(","),
+        "\t": sample.count("\t"),
+        "|": sample.count("|"),
+        ";": sample.count(";")
+    }
+    # prefer tabs if prominent
+    if counts["\t"] >= max(counts.values()) and counts["\t"] > 0:
+        return "\t"
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample[:4096])
+        return dialect.delimiter
+    except Exception:
+        delim = max(counts, key=counts.get)
+        return delim if counts[delim] > 0 else ","
+
+def load_resources(path: Optional[Path]) -> pd.DataFrame:
+    if path is None:
+        return pd.DataFrame()
+    raw_bytes = None
+    try:
+        with open(path, "rb") as f:
+            raw_bytes = f.read(65536)
+    except Exception as e:
+        logger.warning("Could not read CSV bytes for detection: %s", e)
+        raw_bytes = None
+
+    delim = ","
+    if raw_bytes:
+        try:
+            delim = detect_delimiter(raw_bytes)
+            logger.info("Auto-detected CSV delimiter: '%s' for file %s", delim, str(path))
+        except Exception as e:
+            logger.warning("Delimiter detection failed: %s", e)
+            delim = ","
+
+    # try several separators if needed
+    read_attempts = [delim]
+    if delim != "\t":
+        read_attempts.append("\t")
+    if "," not in read_attempts:
+        read_attempts.append(",")
+
+    df = pd.DataFrame()
+    for sep_try in read_attempts:
+        try:
+            df = pd.read_csv(path, sep=sep_try, dtype=str, keep_default_na=False, encoding="utf-8", engine="python", on_bad_lines="skip")
+            logger.info("Loaded CSV with sep='%s' -> rows: %d, cols: %d", sep_try, len(df), len(df.columns))
+            if len(df.columns) == 1:
+                sample_col_vals = df.iloc[:, 0].astype(str)
+                if sample_col_vals.str.contains("\t").any():
+                    logger.info("Single-column CSV contains tabs — splitting column by tab characters.")
+                    split_df = df.iloc[:, 0].str.split("\t", expand=True)
+                    split_df.columns = [f"col{i}" for i in range(split_df.shape[1])]
+                    df = split_df
+            df = df.dropna(axis=1, how="all")
+            if not df.empty:
+                break
+        except Exception as e:
+            logger.warning("read_csv failed with sep='%s': %s", sep_try, e)
+            df = pd.DataFrame()
+            continue
+
+    if df.empty:
+        logger.error("Failed to read CSV at %s with tried separators %s", path, read_attempts)
+        return pd.DataFrame()
+
+    # clean cells
+    for c in df.columns:
+        df[c] = df[c].apply(lambda v: clean_text(v) if not pd.isna(v) else "")
+
+    # normalize column names and remove duplicates
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # relaxed: keep any row with at least one non-empty cell
+    try:
+        df = df[df.astype(bool).any(axis=1)].reset_index(drop=True)
+    except Exception:
+        pass
+
+    logger.info("After normalization, final resource rows: %d, columns: %s", len(df), df.columns.tolist())
+    return df
+
+def build_resource_texts(df: pd.DataFrame) -> List[str]:
+    texts = []
+    if df is None or df.empty:
+        return texts
+    for _, row in df.iterrows():
+        pieces = []
+        for col in df.columns:
+            v = row.get(col, "")
+            if isinstance(v, str) and v.strip():
+                pieces.append(v.strip())
+        text_blob = " | ".join(pieces)
+        text_blob = clean_text(text_blob)
+        texts.append(text_blob)
+    return texts
+
+def learn_csv_skills(df: pd.DataFrame):
+    s = set()
+    if df is None or df.empty:
+        return s
+    for col in df.columns:
+        if "skill" in col.lower() or "topics" in col.lower() or "course" in col.lower():
+            for val in df[col].dropna().astype(str).tolist():
+                for token in re.split(r"[,;/\|]", val):
+                    token = clean_text(token).lower().strip()
+                    if 1 < len(token) <= 80 and token not in STOPWORDS and token not in EXTRA_BLACKLIST:
+                        s.add(token)
+    for col in df.columns:
+        if any(x in col.lower() for x in ("title", "short", "desc", "name")):
+            for val in df[col].dropna().astype(str).tolist():
+                for phrase in TECH_PHRASES:
+                    if phrase in val.lower():
+                        s.add(phrase)
+    return s
+
+# ---------- initialize model & resources ----------
+def initialize():
+    global MODEL, RESOURCES_DF, RESOURCE_TEXTS, RESOURCE_EMBEDDINGS, CSV_SKILLS, KNOWN_SKILLS, KNOWN_EMBS
+    if DATA_PATH:
+        RESOURCES_DF = load_resources(DATA_PATH)
+    else:
+        RESOURCES_DF = pd.DataFrame()
+    RESOURCE_TEXTS = build_resource_texts(RESOURCES_DF)
+    logger.info("CSV rows text built: %s", len(RESOURCE_TEXTS))
+    CSV_SKILLS = learn_csv_skills(RESOURCES_DF)
+
+    # load SBERT
+    model_name = os.getenv("SBERT_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    logger.info("Loading SBERT model: %s", model_name)
+    try:
+        MODEL = SentenceTransformer(model_name)
+        logger.info("SBERT model loaded.")
+    except Exception as e:
+        logger.exception("Failed to load SBERT model: %s", e)
+        MODEL = None
+
+    if MODEL and RESOURCE_TEXTS:
+        try:
+            RESOURCE_EMBEDDINGS = MODEL.encode(RESOURCE_TEXTS, convert_to_tensor=True, show_progress_bar=True, normalize_embeddings=True)
+            logger.info("Resource embeddings computed: %s", getattr(RESOURCE_EMBEDDINGS, "shape", None))
+        except Exception as e:
+            logger.exception("Failed to compute resource embeddings: %s", e)
+            RESOURCE_EMBEDDINGS = None
+    else:
+        RESOURCE_EMBEDDINGS = None
+        if not RESOURCE_TEXTS:
+            logger.warning("No resource texts found or MODEL missing; recommendations disabled until CSV + model are available.")
+
+    # spaCy & known skill embeddings
+    try:
+        nlp = spacy.load("en_core_web_sm")
+        logger.info("spaCy model loaded.")
+    except Exception as e:
+        logger.exception("Failed to load spaCy model: %s", e)
+        nlp = None
+
+    KNOWN_SKILLS = sorted(list(CSV_SKILLS.union(set(TECH_PHRASES))))
+    if MODEL and KNOWN_SKILLS:
+        try:
+            KNOWN_EMBS = MODEL.encode(KNOWN_SKILLS, convert_to_tensor=True, normalize_embeddings=True)
+            logger.info("Known skills embeddings computed: %s", len(KNOWN_SKILLS))
+        except Exception as e:
+            logger.exception("Failed to compute KNOWN_SKILLS embeddings: %s", e)
+            KNOWN_EMBS = None
+    else:
+        KNOWN_EMBS = None
+
+    # init semantic extractor helper
+    try:
+        if nlp and MODEL:
+            semx.init(nlp, MODEL, KNOWN_SKILLS, KNOWN_EMBS)
+            logger.info("semantic_extractor initialized with %d known skills", len(KNOWN_SKILLS))
+        else:
+            logger.warning("semantic_extractor not initialized (nlp or MODEL missing).")
+    except Exception as e:
+        logger.exception("Failed to init semantic_extractor: %s", e)
+
+initialize()
+
+# ---------------- utility: extract recommendation from CSV row ----------------
+def extract_recommendation_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        return {"title": str(row)}
+    def _get(keys):
+        for k in keys:
+            if k in row and row[k]:
+                return clean_text(row[k])
+        return ""
+    title = _get(["Title", "title", "Course Title", "Course", "Name", "Course Title"]) or ""
+    url = _get(["URL", "Url", "Link", "Course URL", "Course Link"])
+    desc = _get(["Short Intro", "Description", "Course Short Intro", "What you learn"])
+    platform = _get(["Site", "Platform", "School", "Provider"])
+    rating_raw = _get(["Rating", "Stars", "Average Rating", "Number of ratings"])
+    duration = _get(["Duration", "Weekly study", "Approx. time", "Monthly access", "4-Month access"])
+    try:
+        rating = float(re.sub(r"[^\d\.]", "", rating_raw)) if rating_raw else None
+    except Exception:
+        rating = None
+    if not title:
+        if desc:
+            title = " ".join(desc.split()[:6]) + "..."
+        else:
+            title = ""
+    return {
+        "title": title,
+        "url": url,
+        "desc": desc,
+        "platform": platform,
+        "rating": rating,
+        "duration": duration
+    }
+
+# ---------------- ngram extractor ----------------
+def generate_ngrams(text: str, n_max: int = 3):
+    tokens = [t.strip().lower() for t in re.split(r"[\W_]+", text) if t.strip()]
+    out = set()
+    L = len(tokens)
+    for n in range(1, n_max + 1):
+        for i in range(0, L - n + 1):
+            gram = " ".join(tokens[i : i + n])
+            out.add(gram)
+    return out
+
+def extract_candidate_skills_from_text(text: str) -> List[str]:
+    text = clean_text(text)
+    ngrams = generate_ngrams(text, n_max=3)
+    candidates = set()
+    for ng in ngrams:
+        if ng in CSV_SKILLS:
+            candidates.add(ng)
+        elif ng in TECH_PHRASES:
+            candidates.add(ng)
+        else:
+            parts = ng.split()
+            if any(p in TECH_PHRASES for p in [" ".join(parts[i:i+2]) for i in range(len(parts)-1)]) :
+                candidates.add(ng)
+            else:
+                if len(ng) > 2 and not any(w in STOPWORDS or w in EXTRA_BLACKLIST for w in ng.split()):
+                    if len(ng) <= 40:
+                        candidates.add(ng)
+    final = [c for c in sorted(candidates) if not re.match(r"^\d+$", c)]
+    return final
+
+# ---------------- core analysis ----------------
+def analyze_texts(job_desc_text: str, resume_text: str = "", top_k_recs: int = 8) -> Dict[str, Any]:
+    t0 = time.time()
+    if MODEL is None:
+        logger.error("No SBERT model available.")
+        return {"data": {"match": {"matched_skills": [], "missing_skills": [], "match_percent": 0.0, "context_similarity": None}, "recommendations": []}}
+
+    jd_text = clean_text(job_desc_text or "")
+    jd_sentences = [s.strip() for s in re.split(r"[.\n;]\s*", jd_text) if s.strip()]
+
+    jd_embedding_mean = None
+    if jd_sentences and MODEL:
+        try:
+            jd_embeddings = MODEL.encode(jd_sentences, convert_to_tensor=True)
+            jd_embedding_mean = jd_embeddings.mean(dim=0)
+        except Exception as e:
+            logger.exception("JD embedding failed: %s", e)
+            jd_embedding_mean = None
+
+    recs = []
+    match_obj = {"matched_skills": [], "missing_skills": [], "match_percent": 0.0, "context_similarity": None}
+
+    # Recommendations via cosine sim (only if we have embeddings)
+    if jd_embedding_mean is not None and RESOURCE_EMBEDDINGS is not None and getattr(RESOURCE_EMBEDDINGS, "shape", (0,))[0] > 0:
+        try:
+            cos_scores = util.cos_sim(jd_embedding_mean, RESOURCE_EMBEDDINGS)
+            cos_arr = cos_scores.detach().cpu().numpy().flatten()
+            logger.info("Sample cos_sim (first 5): %s", cos_arr[:5].tolist())
+            top_k = min(10, len(cos_arr))
+            if top_k > 0:
+                topk_vals = np.sort(cos_arr)[-top_k:]
+                topk_norm = [((float(x) + 1) / 2.0) for x in topk_vals]
+                match_obj["match_percent"] = round(float(np.mean(topk_norm)) * 100, 2)
+                match_obj["context_similarity"] = float(np.max(cos_arr))
+            rec_indices = np.argsort(-cos_arr)[:top_k_recs]
+            for idx in rec_indices:
+                score = float(cos_arr[idx])
+                raw_row = {}
+                if not RESOURCES_DF.empty and idx < len(RESOURCES_DF):
+                    raw_row = RESOURCES_DF.iloc[int(idx)].to_dict()
+                else:
+                    raw_row = {"Title": RESOURCE_TEXTS[idx] if idx < len(RESOURCE_TEXTS) else ""}
+                rec = extract_recommendation_from_row(raw_row)
+                if (not rec["title"].strip() and not rec["desc"].strip()) or (not rec.get("url") and not rec["desc"].strip()):
+                    continue
+                rec["score_percent"] = round(((score + 1) / 2.0) * 100, 2)
+                rec = {k: to_native(v) for k, v in rec.items()}
+                recs.append(rec)
+        except Exception as e:
+            logger.exception("Similarity computation failed: %s", e)
+            recs = []
+    else:
+        logger.info("RESOURCE_EMBEDDINGS not available or empty; skipping recommendations.")
+
+    # Semantic extraction (semantic_extractor helper)
+    try:
+        matched_list, missing_list = semx.semantic_filter(
+            jd_text,
+            resume_text,
+            top_k=30,
+            jd_res_threshold=0.60,
+            canon_cutoff=0.80,
+            keep_tech_only=True
+        )
+    except Exception as e:
+        logger.exception("Semantic extraction failed: %s", e)
+        matched_list, missing_list = [], []
+
+    # Promote resume tokens
+    def normalize_token(t):
+        return re.sub(r"[^a-z0-9\+\#\.]+", " ", t.lower()).strip()
+
+    resume_tokens = set(normalize_token(s) for s in extract_candidate_skills_from_text(resume_text))
+    for tok in resume_tokens:
+        if tok and (tok in (p.lower() for p in TECH_PHRASES) or tok in (s.lower() for s in matched_list) or tok in (s.lower() for s in missing_list)):
+            if tok not in (m.lower() for m in matched_list):
+                matched_list.append(tok)
+
+    # canonicalization + blacklist
+    LOCAL_CANON = {
+        "express": "express.js", "express js": "express.js",
+        "node": "node.js", "node js": "node.js", "mongo": "mongodb",
+        "mongoose": "mongodb", "tailwind": "tailwindcss", "tailwind css": "tailwindcss",
+        "tailwind css backend": "tailwindcss", "jwt/oauth": "jwt", "jwt oauth": "jwt",
+        "docker basic understanding": "docker", "docker basics": "docker",
+        "aws / firebase exposure": "firebase"
+    }
+    LOCAL_BLACKLIST = set(["technologies", "test", "ui design"]) | EXTRA_BLACKLIST
+
+    def canonicalize_and_dedupe(lst):
+        out = []
+        seen = set()
+        for s in lst:
+            s0 = s.strip().lower()
+            if not s0:
+                continue
+            if len(s0.split()) > 6:
+                continue
+            if s0 in LOCAL_BLACKLIST:
+                continue
+            canon = LOCAL_CANON.get(s0, s0)
+            if canon in seen:
+                continue
+            seen.add(canon)
+            out.append(canon)
+        return out
+
+    matched_list = canonicalize_and_dedupe(matched_list)
+    missing_list = canonicalize_and_dedupe(missing_list)
+
+    # ensure matched/missing disjoint
+    matched_set = set(matched_list)
+    final_missing = [m for m in missing_list if m not in matched_set]
+
+    # fallback match percent if resource-based not computed
+    if match_obj["match_percent"] == 0.0:
+        denom = len(matched_list) + len(final_missing)
+        match_obj["match_percent"] = round((len(matched_list) / denom) * 100, 2) if denom > 0 else 0.0
+        if RESOURCE_EMBEDDINGS is None or getattr(RESOURCE_EMBEDDINGS, "shape", (0,))[0] == 0:
+            match_obj["context_similarity"] = None
+
+    match_obj["matched_skills"] = sorted(matched_list, key=lambda s: s.lower())
+    match_obj["missing_skills"] = sorted(final_missing, key=lambda s: s.lower())
+
+    return {
+        "data": {
+            "match": match_obj,
+            "recommendations": {"recommended": recs}
+        }
+    }
+
+# ---------------- endpoints ----------------
+@app.get("/")
+async def root():
+    return {"status": True, "resources": len(RESOURCE_TEXTS), "model_loaded": MODEL is not None}
+
+@app.get("/debug/resources")
+async def debug_resources():
+    sample_titles = []
+    if not RESOURCES_DF.empty:
+        for i, r in RESOURCES_DF.head(10).iterrows():
+            title = r.get("Title") or r.get("title") or r.get("Course Title") or ""
+            url = r.get("URL") or r.get("Url") or r.get("Link") or r.get("Course URL") or ""
+            sample_titles.append({"title": title, "url": url})
+    emb_shape = None
+    if RESOURCE_EMBEDDINGS is not None:
+        try:
+            emb_shape = tuple(RESOURCE_EMBEDDINGS.shape)
+        except Exception:
+            emb_shape = str(type(RESOURCE_EMBEDDINGS))
+    return {
+        "DATA_PATH": str(DATA_PATH) if DATA_PATH else None,
+        "resources_count": len(RESOURCE_TEXTS),
+        "sample_titles": sample_titles,
+        "first_5_resource_texts": RESOURCE_TEXTS[:5],
+        "resource_embeddings_shape": emb_shape,
+        "known_skills_count": len(KNOWN_SKILLS)
+    }
 
 @app.post("/api/analyze")
-async def analyze(jd_text: str = Form(...), resume_pdf: UploadFile = File(None)):
-    """
-    Accepts form-data: jd_text (string), optional resume_pdf upload.
-    Returns match scores, matched/missing skills (simple heuristic), and recommendations.
-    """
+async def api_analyze(
+    resume_pdf: Optional[UploadFile] = File(None),
+    jd_text: Optional[str] = Form(None),
+):
     try:
-        # 1) extract resume text from PDF if provided
         resume_text = ""
         if resume_pdf is not None:
-            data = await resume_pdf.read()
-            try:
-                with pdfplumber.open(io.BytesIO(data)) as pdf:
-                    pages = [p.extract_text() or "" for p in pdf.pages]
-                    resume_text = "\n".join(pages)
-            except Exception as e:
-                print("PDF parse error:", e)
-                resume_text = ""
+            file_bytes = await resume_pdf.read()
+            resume_text = extract_text_from_pdf_bytes(file_bytes)
+            logger.info("Extracted resume text length: %s", len(resume_text))
 
-        # 2) compute "context similarity" between JD and resume
-        context_sim_pct = 0.0
-        if resume_text.strip():
-            # Try SBERT -> cosine on embeddings
-            if SBERT_AVAILABLE and embedder is not None:
-                try:
-                    emb = embedder.encode([jd_text, resume_text], convert_to_numpy=True)
-                    a, b = emb[0], emb[1]
-                    cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-                    context_sim_pct = round(max(0.0, min(1.0, cos)) * 100.0, 2)
-                except Exception as e:
-                    print("SBERT cosine failed:", e)
-                    context_sim_pct = 0.0
-            else:
-                # fallback to TF-IDF similarity if available
-                q_vec = compute_text_embedding(jd_text)
-                r_vec = compute_text_embedding(resume_text)
-                if q_vec is not None and r_vec is not None:
-                    try:
-                        cos = float(
-                            np.dot(q_vec, r_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(r_vec) + 1e-9)
-                        )
-                        context_sim_pct = round(max(0.0, min(1.0, cos)) * 100.0, 2)
-                    except Exception as e:
-                        print("Fallback cosine error:", e)
-                        context_sim_pct = 0.0
-                else:
-                    context_sim_pct = 0.0
-        else:
-            context_sim_pct = 0.0
+        jd_text_val = clean_text(jd_text or "")
+        if not jd_text_val and resume_text:
+            logger.info("No JD provided; using resume text as fallback for analysis.")
+            jd_text_val = resume_text[:4000]
 
-        # 3) simple "skill extraction" heuristic:
-        #   - split JD by commas and newlines and common separators, take short tokens as skill candidates
-        tokens = []
-        raw = jd_text.replace("/", ",").replace("|", ",").replace("•", ",").replace("·", ",")
-        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
-        # choose candidate phrases (trim to 2-5 words)
-        skill_candidates = []
-        for p in parts:
-            # ignore very long sentences
-            words = p.split()
-            if 1 < len(words) <= 5:
-                skill_candidates.append(p)
-            elif len(words) == 1:
-                skill_candidates.append(p)
-            else:
-                # split long sentence into smaller by 'and' or 'or'
-                sub = []
-                if " and " in p or " or " in p:
-                    for s in p.replace(" and ", ",").replace(" or ", ",").split(","):
-                        s = s.strip()
-                        if s and len(s.split()) <= 4:
-                            sub.append(s)
-                if sub:
-                    skill_candidates.extend(sub)
-        # dedupe while preserving order
-        seen = set()
-        skill_candidates_clean = []
-        for s in skill_candidates:
-            key = s.lower()
-            if key not in seen:
-                seen.add(key)
-                skill_candidates_clean.append(s)
-        skill_candidates = skill_candidates_clean[:30]
+        if not jd_text_val:
+            return JSONResponse(status_code=400, content={"error": "No job description text provided. Provide jd_text or upload resume."})
 
-        # 4) matched / missing by simple substring match in resume text (lowercase)
-        resume_lower = resume_text.lower()
-        matched = []
-        missing = []
-        for s in skill_candidates:
-            if resume_lower and s.lower() in resume_lower:
-                matched.append(s)
-            else:
-                missing.append(s)
-
-        # 5) Build query for recommendations: jd + missing skills text
-        query_text = jd_text + " " + " ".join(missing)
-
-        # 6) find recommended resources
-        recommended = []
-        TOP_K = 6
-
-        # If we have SBERT embeddings and nbrs:
-        if SBERT_AVAILABLE and resource_embeddings is not None and nbrs is not None:
-            q_emb = compute_text_embedding(query_text)
-            if q_emb is not None:
-                try:
-                    # kneighbors expects same dimension
-                    dists, idxs = nbrs.kneighbors([q_emb], n_neighbors=min(TOP_K, resource_embeddings.shape[0]))
-                    for dist, idx in zip(dists[0], idxs[0]):
-                        row = df.iloc[int(idx)].to_dict()
-                        score = float((1.0 - dist) * 100.0)
-                        row["score_percent"] = round(score, 2)
-                        recommended.append(row)
-                except Exception as e:
-                    print("NearestNeighbors/kneighbors failed:", e)
-
-        # Else if we have TF-IDF matrix:
-        elif resource_tfidf is not None and vectorizer is not None:
-            q_vec = None
-            try:
-                q_vec = vectorizer.transform([query_text])
-                sims = cosine_similarity(q_vec, resource_tfidf).reshape(-1)
-                # pick top indices
-                top_idx = np.argsort(-sims)[:TOP_K]
-                for idx in top_idx:
-                    if idx < len(df):
-                        row = df.iloc[int(idx)].to_dict()
-                        row["score_percent"] = round(float(sims[idx]) * 100.0, 2)
-                        recommended.append(row)
-            except Exception as e:
-                print("TF-IDF recommendation failed:", e)
-
-        # Final fallback: if nothing worked, return first N rows as fallback
-        if not recommended and df is not None and len(df) > 0:
-            for i in range(min(TOP_K, len(df))):
-                row = df.iloc[int(i)].to_dict()
-                row["score_percent"] = 0.0
-                recommended.append(row)
-
-        # prepare response
-        match_percent = round((len(matched) / (len(skill_candidates) + 1)) * 100.0, 2) if skill_candidates else 0.0
-
-        response = {
-            "data": {
-                "match": {
-                    "context_similarity": context_sim_pct,
-                    "match_percent": match_percent,
-                    "matched_skills": matched,
-                    "missing_skills": missing,
-                },
-                "recommendations": {"recommended": recommended},
-            }
+        raw = analyze_texts(jd_text_val, resume_text=resume_text, top_k_recs=8)
+        normalized = {
+            "match": raw.get("data", {}).get("match", {}),
+            "recommendations": raw.get("data", {}).get("recommendations", {}).get("recommended", [])
         }
-        return response
-
+        if "context_similarity" in normalized["match"] and normalized["match"]["context_similarity"] is None:
+            normalized["match"]["context_similarity"] = None
+        normalized["_meta"] = {
+            "model_name": os.getenv("SBERT_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+            "resources_count": len(RESOURCE_TEXTS)
+        }
+        return JSONResponse(content=normalized)
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Analyze endpoint error: %s", e)
+        return JSONResponse(status_code=500, content={"error": "server error", "detail": str(e)})
 
-
-@app.post("/api/recommend_resources")
-async def recommend_resources(payload: dict):
-    """
-    Accepts payload: { "jd_text": "...", "missing_skills": [...], "top_k": 6 }
-    Returns list of recommended resources (same logic as above)
-    """
-    try:
-        jd_text = payload.get("jd_text", "")
-        missing = payload.get("missing_skills", []) or []
-        top_k = int(payload.get("top_k", 6))
-
-        query_text = jd_text + " " + " ".join(missing)
-
-        recs = []
-        # SBERT path
-        if SBERT_AVAILABLE and resource_embeddings is not None and nbrs is not None:
-            q_emb = compute_text_embedding(query_text)
-            if q_emb is not None:
-                try:
-                    dists, idxs = nbrs.kneighbors([q_emb], n_neighbors=min(top_k, resource_embeddings.shape[0]))
-                    for dist, idx in zip(dists[0], idxs[0]):
-                        row = df.iloc[int(idx)].to_dict()
-                        score = float((1.0 - dist) * 100.0)
-                        row["score_percent"] = round(score, 2)
-                        recs.append(row)
-                except Exception as e:
-                    print("NearestNeighbors/kneighbors failed in recommend_resources:", e)
-
-        # TF-IDF path
-        elif resource_tfidf is not None and vectorizer is not None:
-            try:
-                q_vec = vectorizer.transform([query_text])
-                sims = cosine_similarity(q_vec, resource_tfidf).reshape(-1)
-                top_idx = np.argsort(-sims)[:top_k]
-                for idx in top_idx:
-                    if idx < len(df):
-                        row = df.iloc[int(idx)].to_dict()
-                        row["score_percent"] = round(float(sims[idx]) * 100.0, 2)
-                        recs.append(row)
-            except Exception as e:
-                print("TF-IDF recommend_resources failed:", e)
-
-        # fallback
-        if not recs and df is not None:
-            for i in range(min(top_k, len(df))):
-                row = df.iloc[int(i)].to_dict()
-                row["score_percent"] = 0.0
-                recs.append(row)
-
-        return {"results": recs}
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 9000)), reload=True)

@@ -1,227 +1,128 @@
-import React, { useMemo } from "react";
-import {
-  Chart as ChartJS,
-  ArcElement,
-  Tooltip,
-  Legend,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-} from "chart.js";
-import { Doughnut, Bar } from "react-chartjs-2";
-import {
-  FaCheckCircle,
-  FaExclamationTriangle,
-  FaBookOpen,
-  FaChartLine,
-} from "react-icons/fa";
+// src/components/Results.jsx
+import React from "react";
 
-ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement);
-
-export default function Results({ analysis, loading, error }) {
-  if (loading)
+export default function Results({ analysis = null, loading = false, error = "" }) {
+  if (loading) {
     return (
-      <div className="bg-white shadow-lg rounded-lg p-6 text-center text-indigo-600 font-semibold">
-        Analyzing...
+      <div className="bg-white rounded-lg shadow-sm p-6">
+        <h2 className="text-lg font-semibold mb-3">Analysis Results</h2>
+        <div className="text-sm text-gray-500">Waiting for results…</div>
       </div>
     );
-  if (error)
+  }
+
+  if (error) {
     return (
-      <div className="bg-white shadow-lg rounded-lg p-6 text-center text-red-600 font-semibold">
-        Error: {error}
+      <div className="bg-white rounded-lg shadow-sm p-6">
+        <h2 className="text-lg font-semibold mb-3">Analysis Results</h2>
+        <div className="text-sm text-red-600">Error: {error}</div>
       </div>
     );
-  if (!analysis)
+  }
+
+  if (!analysis) {
     return (
-      <div className="bg-white shadow-lg rounded-lg p-6 text-center text-gray-500">
-        Upload your resume and paste the job description to begin.
+      <div className="bg-white rounded-lg shadow-sm p-6">
+        <h2 className="text-lg font-semibold mb-3">Analysis Results</h2>
+        <div className="text-sm text-gray-400">No analysis yet - submit a resume and job description.</div>
       </div>
     );
+  }
 
-  const match = analysis.match || {};
-  const recs =
-    (analysis.recommendations && analysis.recommendations.recommended) || [];
+  const matched = analysis.matchedSkills ?? [];
+  const recs = analysis.recommendations ?? [];
+  const raw = analysis.raw ?? {};
+  const score = typeof analysis.score === "number" ? Math.round(analysis.score * 100) : 
+                (raw.match && raw.match.match_percent ? Math.round(Number(raw.match.match_percent)) : null);
 
-  const ctxVal = match.context_similarity ?? 0;
-  const doughnutData = {
-    labels: ["Match", "Other"],
-    datasets: [
-      {
-        data: [ctxVal, Math.max(0, 1 - ctxVal)],
-        backgroundColor: ["#6366f1", "#e5e7eb"],
-        borderWidth: 0,
-      },
-    ],
-  };
-
-  const skillPct = match.match_percent ?? 0;
-
-  const topRecs = [...recs]
-    .sort((a, b) => (b.score_percent || 0) - (a.score_percent || 0))
-    .slice(0, 5);
-
-  const barData = {
-    labels: topRecs.map((r) => (r.title || "Course").slice(0, 25)),
-    datasets: [
-      {
-        label: "Relevance",
-        data: topRecs.map((r) => r.score_percent || 0),
-        backgroundColor: "rgba(99,102,241,0.8)",
-        borderRadius: 6,
-      },
-    ],
-  };
+  // derive missing skills if available in raw
+  let missing = [];
+  if (raw.match && Array.isArray(raw.match.missing_skills)) {
+    missing = raw.match.missing_skills;
+  } else if (Array.isArray(analysis.missingSkills)) {
+    missing = analysis.missingSkills;
+  }
 
   return (
-    <div className="space-y-6">
-      {/* Overview Card */}
-      <div className="bg-white rounded-xl shadow-md p-6 hover:shadow-lg transition">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-semibold flex items-center gap-2 text-gray-800">
-            <FaChartLine className="text-indigo-500" /> Overview
-          </h3>
-          <p className="text-sm text-gray-500">AI-Powered Semantic Matching</p>
-        </div>
+    <div className="bg-white rounded-lg shadow-sm p-6">
+      <h2 className="text-lg font-semibold mb-3">Analysis Results</h2>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Context Similarity Donut */}
-          <div className="flex flex-col items-center">
-            <div className="relative w-44 h-44">
-              <Doughnut
-                data={doughnutData}
-                options={{
-                  cutout: "78%",
-                  plugins: { legend: { display: false } },
-                }}
-              />
-              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                <span className="text-3xl font-bold text-gray-800">
-                  {Math.round(ctxVal * 100)}%
-                </span>
-                <span className="text-gray-500 text-sm">Context</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Skill Match Progress */}
-          <div className="space-y-4">
-            <div>
-              <div className="flex items-center gap-2 text-indigo-600 font-semibold mb-1">
-                <FaCheckCircle /> Skill Match
-              </div>
-              <div className="w-full bg-gray-200 rounded-full h-3">
-                <div
-                  className="bg-indigo-500 h-3 rounded-full transition-all duration-700"
-                  style={{ width: `${skillPct}%` }}
-                />
-              </div>
-              <div className="flex justify-between text-sm text-gray-500 mt-1">
-                <span>Match</span>
-                <span className="font-semibold text-gray-700">{skillPct}%</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex items-center gap-2 text-amber-600 font-semibold mb-1">
-                <FaExclamationTriangle /> Missing Skills
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {match.missing_skills?.length ? (
-                  match.missing_skills.map((s, i) => (
-                    <span
-                      key={i}
-                      className="px-3 py-1 text-sm bg-amber-100 text-amber-700 rounded-full font-medium"
-                    >
-                      {s}
-                    </span>
-                  ))
-                ) : (
-                  <span className="text-gray-400 text-sm">None</span>
-                )}
-              </div>
-            </div>
+      <div className="space-y-4">
+        <div>
+          <div className="text-sm text-gray-500 mb-1">Match Score</div>
+          <div className="text-2xl font-bold text-indigo-600">
+            {score !== null ? `${score}%` : "N/A"}
           </div>
         </div>
-      </div>
 
-      {/* Matched Skills */}
-      <div className="bg-white rounded-xl shadow-md p-6 hover:shadow-lg transition">
-        <h3 className="text-lg font-semibold mb-3 flex items-center gap-2 text-green-600">
-          <FaCheckCircle /> Matched Skills
-        </h3>
-        <div className="flex flex-wrap gap-2">
-          {match.matched_skills?.length ? (
-            match.matched_skills.map((s, i) => (
-              <span
-                key={i}
-                className="px-3 py-1 text-sm bg-green-100 text-green-700 rounded-full font-medium"
-              >
-                {s}
-              </span>
-            ))
+        <div>
+          <div className="text-sm text-gray-500 mb-2">Matched Skills</div>
+          {matched.length ? (
+            <ul className="flex flex-wrap gap-2">
+              {matched.map((s, i) => (
+                <li
+                  key={i}
+                  className="bg-indigo-50 text-indigo-700 px-3 py-1 rounded-full text-xs border"
+                >
+                  {typeof s === "string" ? s : s?.name ?? JSON.stringify(s).slice(0, 30)}
+                </li>
+              ))}
+            </ul>
           ) : (
-            <span className="text-gray-400 text-sm">None</span>
+            <div className="text-xs text-gray-400">No matched skills found</div>
           )}
         </div>
-      </div>
 
-      {/* Recommendations */}
-      <div className="bg-white rounded-xl shadow-md p-6 hover:shadow-lg transition">
-        <h3 className="text-lg font-semibold mb-3 flex items-center gap-2 text-indigo-600">
-          <FaBookOpen /> Top Recommendations
-        </h3>
-        {topRecs.length ? (
-          <>
-            <div className="h-60 mb-4">
-              <Bar
-                data={barData}
-                options={{
-                  indexAxis: "y",
-                  plugins: { legend: { display: false } },
-                  scales: { x: { max: 100, ticks: { stepSize: 20 } } },
-                  maintainAspectRatio: false,
-                }}
-              />
-            </div>
-
-            <div className="divide-y">
-              {topRecs.map((r, i) => (
-                <div
+        <div>
+          <div className="text-sm text-gray-500 mb-2">Missing Skills</div>
+          {missing.length ? (
+            <ul className="flex flex-wrap gap-2">
+              {missing.map((s, i) => (
+                <li
                   key={i}
-                  className="py-3 flex justify-between items-center hover:bg-gray-50 px-2 rounded-lg"
+                  className="bg-red-50 text-red-700 px-3 py-1 rounded-full text-xs border"
                 >
-                  <div>
-                    <div className="font-medium text-gray-800">
-                      {r.title || "Course"}
-                    </div>
-                    <div className="text-sm text-gray-500">
-                      {r.provider || "Online Platform"}
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="font-bold text-indigo-600">
-                      {r.score_percent || 0}%
-                    </div>
-                    {r.url && (
-                      <a
-                        href={r.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-sm text-indigo-500 font-medium hover:underline"
-                      >
-                        Open
-                      </a>
-                    )}
-                  </div>
-                </div>
+                  {typeof s === "string" ? s : s?.name ?? JSON.stringify(s).slice(0, 30)}
+                </li>
               ))}
-            </div>
-          </>
-        ) : (
-          <div className="text-gray-400 text-sm text-center py-4">
-            No relevant recommendations found.
-          </div>
-        )}
+            </ul>
+          ) : (
+            <div className="text-xs text-gray-400">No missing skills identified</div>
+          )}
+        </div>
+
+        <div>
+          <div className="text-sm text-gray-500 mb-2">Top Recommendations</div>
+          {recs.length ? (
+            <ol className="list-decimal pl-5 space-y-2 text-sm">
+              {recs.map((r, i) => (
+                <li key={i} className="space-y-0.5">
+                  <div className="font-medium">
+                    {r?.title ?? r?.name ?? (typeof r === "string" ? r : "Untitled")}
+                  </div>
+                  {r?.platform && <div className="text-xs text-gray-500">{r.platform}</div>}
+                  {r?.desc && <div className="text-xs text-gray-600">{r.desc}</div>}
+                  {r?.url && (
+                    <div className="text-xs">
+                      <a href={r.url} target="_blank" rel="noreferrer" className="text-indigo-600 underline">
+                        View course
+                      </a>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <div className="text-xs text-gray-400">No recommendations returned</div>
+          )}
+        </div>
+
+        <div>
+          <div className="text-sm text-gray-500 mb-2">Raw response (debug)</div>
+          <pre className="bg-gray-50 p-3 rounded text-xs text-gray-700 overflow-auto max-h-48">
+            {JSON.stringify(raw, null, 2)}
+          </pre>
+        </div>
       </div>
     </div>
   );
