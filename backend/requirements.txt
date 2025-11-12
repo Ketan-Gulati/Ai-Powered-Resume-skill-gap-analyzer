@@ -1,8 +1,9 @@
-fastapi
-uvicorn
-pdfplumber
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
 pandas
 numpy
 scikit-learn
-sentence-transformers
+pdfplumber
+sentence-transformers>=2.0.0 
+torch>=2.0.0   # required if sentence-transformers
 python-multipart
