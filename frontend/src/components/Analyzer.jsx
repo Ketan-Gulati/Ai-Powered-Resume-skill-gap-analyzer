@@ -1,222 +1,181 @@
-// src/components/Analyzer.jsx
 import React, { useState, useRef } from "react";
 import axios from "axios";
 import Loader from "./Loader";
-import Results from "./Results";
-import SkillChart from "./SkillChart";
+import {
+  Upload,
+  FileText,
+  Sparkles,
+  Wand2,
+} from "lucide-react";
 
-/**
- * Analyzer component
- * - Attempts proxy endpoint (/api/analyze) first (works with vite proxy)
- * - If proxy fails with network error, falls back to direct backend URL (http://127.0.0.1:9000/api/analyze)
- * - Sends file as 'resume_pdf' (matches backend)
- */
-
-export default function Analyzer() {
-  const fileRef = useRef(null);
+export default function Analyzer({ onResult }) {
   const [jdText, setJdText] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [responseData, setResponseData] = useState(null);
-
-  // endpoints:
-  const PROXY_URL = `/api/analyze`; // preferred (Vite proxy)
-  const DIRECT_URL = `http://127.0.0.1:9000/api/analyze`; // fallback (direct to backend)
-
-  const buildForm = (file) => {
-    const form = new FormData();
-    if (file) form.append("resume_pdf", file); // backend expects resume_pdf
-    form.append("jd_text", jdText ?? "");
-    return form;
-  };
-
-  const postTo = async (url, form) => {
-    return axios.post(url, form, {
-      headers: { "Content-Type": "multipart/form-data" },
-      timeout: 120000,
-    });
-  };
+  const fileRef = useRef(null);
 
   const analyze = async (e) => {
-    e?.preventDefault();
+    e.preventDefault();
     setError("");
-    setResponseData(null);
 
     const file = fileRef.current?.files?.[0] ?? null;
+
     if (!file && !jdText.trim()) {
-      setError("Please upload a resume (PDF) or paste a job description.");
+      setError("Upload a resume or paste a Job Description.");
       return;
     }
 
-    const form = buildForm(file);
+    const form = new FormData();
+    if (file) form.append("resume_pdf", file);
+    form.append("jd_text", jdText);
 
     setLoading(true);
 
-    // Try proxy first, then direct backend fallback if proxy fails with network/ECONNREFUSED
     try {
-      let resp;
-      try {
-        resp = await postTo(PROXY_URL, form);
-      } catch (proxyErr) {
-        // If proxy error looks like network/proxy problem, try direct backend URL
-        const code = proxyErr?.code || (proxyErr?.response?.status && String(proxyErr.response.status));
-        const isNetworkError = proxyErr?.message?.toLowerCase()?.includes("network") || proxyErr?.code === "ECONNREFUSED";
-        // log proxy failure
-        console.warn("Proxy request failed, attempting direct backend. proxyErr:", proxyErr?.message || proxyErr);
-        if (isNetworkError) {
-          // fallback to direct backend
-          resp = await postTo(DIRECT_URL, form);
-        } else {
-          // if not a network error (e.g., 4xx/5xx), rethrow to outer catch
-          throw proxyErr;
-        }
-      }
-
-      const final = resp.data ?? {};
-
-      // Normalize backend response for frontend components
-      const matchBlock = final.match ?? final.data?.match ?? {};
-      const matchedSkills = matchBlock.matched_skills ?? matchBlock.matchedSkills ?? [];
-      const missingSkills = matchBlock.missing_skills ?? matchBlock.missing ?? [];
-      const matchPercent = matchBlock.match_percent ?? matchBlock.matchPercent ?? null;
-
-      // recommendations may be in different spots
-      let recs = [];
-      if (Array.isArray(final.recommendations)) recs = final.recommendations;
-      else if (Array.isArray(final.data?.recommendations)) recs = final.data.recommendations;
-      else if (Array.isArray(final.data?.recommendations?.recommended)) recs = final.data.recommendations.recommended;
-      else if (Array.isArray(final.recommendations?.recommended)) recs = final.recommendations.recommended;
-      else recs = final.recommendations || final.data?.recommendations?.recommended || [];
-
-      // ensure each rec has url field (empty string if missing)
-      recs = (Array.isArray(recs) ? recs : []).map((r) => {
-        if (!r) return {};
-        return {
-          title: r.title ?? r.name ?? "Untitled Course",
-          url: r.url ?? r.link ?? r.course_url ?? r.CourseURL ?? "",
-          desc: r.desc ?? r.description ?? r.CourseShortIntro ?? "",
-          platform: r.platform ?? r.site ?? "",
-          rating: r.rating ?? r.stars ?? null,
-          duration: r.duration ?? "",
-          score_percent: r.score_percent ?? r.score ?? null,
-        };
+      const response = await axios.post("/api/analyze", form, {
+        headers: { "Content-Type": "multipart/form-data" },
       });
 
-      setResponseData({
-        matchedSkills,
-        missingSkills,
-        recommendations: recs,
-        score: typeof matchPercent === "number" ? matchPercent / 100 : null,
-        raw: final,
-      });
+      if (response.data) onResult(response.data);
     } catch (err) {
-      // Present helpful messages depending on error type
-      console.error("ANALYZE ERROR full:", err, err?.response?.data);
-      // If the server replied with a JSON error (traceback etc.), show its .error or short message
-      const serverData = err?.response?.data;
-      if (serverData && typeof serverData === "object") {
-        setError(serverData.error || serverData.message || "Server error — check console for details.");
-        console.error("Server response body:", serverData);
-      } else if (err?.code === "ECONNREFUSED" || (err?.message && err.message.toLowerCase().includes("network"))) {
-        setError("Network error: could not reach backend. Backend may be down or proxy misconfigured.");
-      } else {
-        setError(err?.message || "Request failed — check console for details.");
-      }
-    } finally {
-      setLoading(false);
+      console.log(err);
+      setError("Backend error. Try again.");
     }
-  };
-
-  const resetAll = () => {
-    if (fileRef.current) fileRef.current.value = "";
-    setJdText("");
-    setResponseData(null);
-    setError("");
+    setLoading(false);
   };
 
   return (
-    <div className="p-6 max-w-6xl mx-auto app-root">
+    <div className="px-6 py-10 max-w-5xl mx-auto">
 
-      <div className="bg-white rounded-lg shadow-sm p-6 mb-6">
-        <form onSubmit={analyze} className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="col-span-1">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Resume (PDF)
+      {/* HEADER SECTION */}
+      <div className="text-center mb-10">
+        <h1 className="text-4xl font-bold text-white tracking-tight mb-2 flex justify-center gap-2 items-center">
+          <Sparkles className="text-indigo-400" size={34} />
+          AI Skill Gap Analyzer
+        </h1>
+
+        <p className="text-gray-300 text-sm">
+          Upload your resume or paste a JD — get insights powered by AI.
+        </p>
+      </div>
+
+      {/* MAIN CARD */}
+      <div className="
+        bg-white/10 backdrop-blur-xl 
+        border border-white/20 
+        rounded-2xl p-8 shadow-xl
+        transition-all duration-300
+        hover:shadow-2xl hover:border-indigo-400/30
+      ">
+        <form onSubmit={analyze}>
+
+          {/* GRID */}
+          <div className="grid md:grid-cols-3 gap-8">
+
+            {/* LEFT SIDE — FILE UPLOAD */}
+            <div className="space-y-3">
+              <label className="text-white font-semibold flex items-center gap-2 text-sm">
+                <Upload size={18} /> Resume (PDF)
               </label>
-              <input
-                ref={fileRef}
-                type="file"
-                accept="application/pdf"
-                className="block w-full text-sm text-gray-700"
-              />
-              <p className="text-xs text-gray-400 mt-2">
-                Upload a resume PDF.
+
+              <div className="
+                bg-white/5 border border-white/10 
+                p-4 rounded-xl text-center cursor-pointer
+                hover:border-indigo-400 hover:bg-white/10
+                transition-all duration-200
+              ">
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="application/pdf"
+                  className="hidden"
+                  id="resumeUpload"
+                />
+
+                <label
+                  htmlFor="resumeUpload"
+                  className="block cursor-pointer text-gray-300 text-sm"
+                >
+                  <FileText className="mx-auto mb-3 text-indigo-300" size={32} />
+                  Click to upload resume PDF
+                </label>
+              </div>
+
+              <p className="text-xs text-gray-400">
+                Uploading a resume is optional if you paste JD.
               </p>
             </div>
 
-            <div className="md:col-span-2">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Job Description (paste)
+            {/* RIGHT SIDE — JOB DESCRIPTION */}
+            <div className="md:col-span-2 space-y-3">
+              <label className="text-white font-semibold flex items-center gap-2 text-sm">
+                <Wand2 size={18} /> Job Description (paste)
               </label>
+
               <textarea
                 value={jdText}
                 onChange={(e) => setJdText(e.target.value)}
-                rows={6}
-                placeholder="Paste the job description or role here"
-                className="w-full rounded-md border-gray-200 shadow-sm focus:ring-2 focus:ring-indigo-300 p-3 text-sm"
+                rows={7}
+                placeholder="Paste the job description here..."
+                className="
+                  w-full bg-white/10 rounded-xl 
+                  border border-white/10 
+                  text-gray-200 p-4 text-sm resize-none
+                  focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400
+                  placeholder-gray-400
+                  transition-all
+                "
               />
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
+          {/* BUTTONS */}
+          <div className="mt-8 flex items-center gap-4">
             <button
               type="submit"
-              className="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition"
               disabled={loading}
+              className="
+                px-6 py-3 rounded-xl text-white font-semibold 
+                bg-gradient-to-r from-indigo-500 to-purple-600
+                hover:from-indigo-600 hover:to-purple-700
+                shadow-lg shadow-indigo-500/20 hover:shadow-purple-600/30
+                transition-all duration-200 active:scale-95
+              "
             >
-              {loading ? "Analyzing…" : "Analyze"}
+              {loading ? "Analyzing..." : "Run Analysis"}
             </button>
 
             <button
               type="button"
-              onClick={resetAll}
-              className="text-gray-700 px-3 py-2 rounded-md border hover:bg-gray-50 text-sm"
-              disabled={loading}
+              onClick={() => {
+                fileRef.current.value = "";
+                setJdText("");
+                onResult(null);
+                setError("");
+              }}
+              className="
+                px-6 py-3 rounded-xl 
+                bg-white/10 text-gray-300 
+                border border-white/10
+                hover:bg-white/20 hover:border-white/20
+                transition-all duration-200
+              "
             >
               Reset
             </button>
 
             {error && (
-              <div className="ml-4 text-sm text-red-600" role="alert">
-                {error}
-              </div>
+              <p className="text-red-400 text-sm ml-3">{error}</p>
             )}
           </div>
         </form>
       </div>
 
+      {/* LOADER */}
       {loading && (
-        <div className="mb-6">
+        <div className="mt-8">
           <Loader />
         </div>
-      )}
-
-      {responseData ? (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
-            <Results data={responseData} />
-          </div>
-
-          <div className="lg:col-span-1">
-            <SkillChart
-              matchedSkills={responseData.matchedSkills ?? []}
-              recommendations={responseData.recommendations ?? []}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="text-sm text-gray-500">No results yet - click Analyze to start.</div>
       )}
     </div>
   );
